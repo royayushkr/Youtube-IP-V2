@@ -348,7 +348,13 @@ def main():
 
     df = pd.DataFrame(rows)
     os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
-    df.to_csv(OUTPUT_CSV, index=False)
+    if os.path.exists(OUTPUT_CSV):
+        df.to_csv(OUTPUT_CSV, mode="a", header=False, index=False)
+        print("Appended to existing CSV.")
+    else:
+        df.to_csv(OUTPUT_CSV, index=False)
+        print("Created new CSV.")
+
 
     print(f"\nWrote dataset: {OUTPUT_CSV}")
     print(f"Rows: {len(df)}  Cols: {len(df.columns)}")
