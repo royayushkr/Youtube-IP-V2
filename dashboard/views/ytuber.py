@@ -1,11 +1,14 @@
 import os
+import re
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
+
 try:
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
@@ -15,10 +18,18 @@ except Exception:
 
 from src.llm_integration.thumbnail_generator import ThumbnailGenerator
 
-DATASET_PATH = os.path.join("data", "youtube api data", "research_science_channels_videos.csv")
 
+DATASET_PATH = os.path.join("data", "youtube api data", "research_science_channels_videos.csv")
 DEFAULT_CATEGORY = "research_science"
 THUMB_KEYS = ["default", "medium", "high", "standard", "maxres"]
+STOPWORDS = {
+    "the", "a", "an", "to", "of", "in", "for", "with", "on", "and", "or", "at", "is", "are", "was", "were",
+    "this", "that", "how", "why", "what", "when", "from", "your", "you", "my", "we", "our", "it", "vs", "into",
+}
+POWER_WORDS = {
+    "secret", "ultimate", "proven", "easy", "fast", "best", "shocking", "truth", "mistake", "science",
+    "future", "breakthrough", "insane", "new", "critical", "warning", "guide", "explained", "hidden", "top",
+}
 
 
 def _safe_get(d: Dict[str, Any], path: List[str], default=None):
@@ -107,7 +118,7 @@ def _fetch_recent_video_ids(
     youtube,
     uploads_playlist_id: str,
     published_after_utc: datetime,
-    max_videos: int = 500,
+    max_videos: int = 600,
 ) -> List[str]:
     video_ids: List[str] = []
     page_token: Optional[str] = None
@@ -258,6 +269,7 @@ def _append_rows_to_dataset(new_rows: pd.DataFrame, existing_df: pd.DataFrame) -
     for c in existing_cols:
         if c not in new_rows.columns:
             new_rows[c] = ""
+
     for c in new_rows.columns:
         if c not in existing_cols:
             existing_df[c] = ""
@@ -265,6 +277,18 @@ def _append_rows_to_dataset(new_rows: pd.DataFrame, existing_df: pd.DataFrame) -
 
     new_rows = new_rows[existing_cols]
     new_rows.to_csv(DATASET_PATH, mode="a", header=False, index=False)
+
+
+def _parse_iso_duration_seconds(duration: str) -> int:
+    if not isinstance(duration, str):
+        return 0
+    match = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration)
+    if not match:
+        return 0
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def _ensure_numeric_and_dates(df: pd.DataFrame) -> pd.DataFrame:
@@ -276,6 +300,194 @@ def _ensure_numeric_and_dates(df: pd.DataFrame) -> pd.DataFrame:
         out["video_publishedAt"] = pd.to_datetime(out["video_publishedAt"], errors="coerce", utc=True)
     out["engagement_rate"] = (out["likes"].fillna(0) + out["comments"].fillna(0)) / out["views"].clip(lower=1)
     out["publish_month"] = out["video_publishedAt"].dt.to_period("M").astype(str)
+    out["publish_day"] = out["video_publishedAt"].dt.day_name()
+    out["publish_hour"] = out["video_publishedAt"].dt.hour
+    out["duration_seconds"] = out["duration"].fillna("").astype(str).map(_parse_iso_duration_seconds)
+    out["is_short"] = out["duration_seconds"] <= 60
+    return out
+
+
+def _tokenize(text: str) -> List[str]:
+    tokens = re.findall(r"[A-Za-z0-9]+", str(text).lower())
+    return [t for t in tokens if len(t) > 2 and t not in STOPWORDS]
+
+
+def _top_keywords(df: pd.DataFrame, top_n: int = 30) -> List[str]:
+    counter: Counter = Counter()
+    for title in df["video_title"].fillna("").astype(str):
+        counter.update(_tokenize(title))
+    return [k for k, _ in counter.most_common(top_n)]
+
+
+def _keyword_intel(df: pd.DataFrame, top_n: int = 40) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
+
+    for _, row in df.iterrows():
+        title = str(row.get("video_title", ""))
+        views = float(row.get("views") or 0)
+        eng = float(row.get("engagement_rate") or 0)
+        published = row.get("video_publishedAt")
+        recency_weight = 1.0
+        if pd.notna(published):
+            days = (now - published.to_pydatetime()).days
+            recency_weight = max(0.1, 1 - min(days / 365, 0.9))
+
+        seen = set(_tokenize(title))
+        for token in seen:
+            rows.append(
+                {
+                    "keyword": token,
+                    "views": views,
+                    "engagement": eng,
+                    "recency_weight": recency_weight,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["keyword", "videos", "avg_views", "avg_engagement", "momentum", "score"])
+
+    kdf = pd.DataFrame(rows)
+    out = (
+        kdf.groupby("keyword", dropna=False)
+        .agg(
+            videos=("keyword", "count"),
+            avg_views=("views", "mean"),
+            avg_engagement=("engagement", "mean"),
+            momentum=("recency_weight", "mean"),
+        )
+        .reset_index()
+    )
+
+    if out.empty:
+        return out
+
+    max_views = max(out["avg_views"].max(), 1)
+    max_eng = max(out["avg_engagement"].max(), 0.0001)
+    max_momentum = max(out["momentum"].max(), 0.0001)
+    competition_proxy = out["videos"] / max(out["videos"].max(), 1)
+
+    out["score"] = (
+        (out["avg_views"] / max_views) * 40
+        + (out["avg_engagement"] / max_eng) * 30
+        + (out["momentum"] / max_momentum) * 20
+        + (1 - competition_proxy) * 10
+    )
+
+    return out.sort_values("score", ascending=False).head(top_n)
+
+
+def _title_score(title: str, keyword_hints: List[str]) -> Tuple[int, Dict[str, int], List[str]]:
+    text = title.strip()
+    lower = text.lower()
+
+    length = len(text)
+    word_count = len(text.split())
+
+    length_score = max(0, 30 - int(abs(length - 55) * 0.8))
+    clarity_score = 20 if 6 <= word_count <= 12 else max(6, 20 - abs(word_count - 9) * 2)
+    number_score = 12 if re.search(r"\d", text) else 0
+    curiosity_score = 10 if any(p in text for p in ["?", "!", ":"]) else 0
+    power_score = min(15, sum(1 for w in POWER_WORDS if w in lower) * 5)
+    keyword_matches = sum(1 for k in keyword_hints[:12] if k and k in lower)
+    keyword_score = min(13, keyword_matches * 3)
+
+    total = max(0, min(100, length_score + clarity_score + number_score + curiosity_score + power_score + keyword_score))
+
+    suggestions: List[str] = []
+    if length < 40:
+        suggestions.append("Make title more specific; 45-65 chars usually performs better.")
+    if length > 70:
+        suggestions.append("Shorten title for stronger mobile readability.")
+    if number_score == 0:
+        suggestions.append("Consider adding a number or quantified claim.")
+    if curiosity_score == 0:
+        suggestions.append("Try adding a curiosity trigger such as '?' or a strong contrast.")
+    if power_score == 0:
+        suggestions.append("Use at least one strong power word (e.g., proven, hidden, breakthrough).")
+    if keyword_score == 0 and keyword_hints:
+        suggestions.append(f"Include one of your high-opportunity keywords: {', '.join(keyword_hints[:5])}.")
+
+    parts = {
+        "Length": int(length_score),
+        "Clarity": int(clarity_score),
+        "Numbers": int(number_score),
+        "Curiosity": int(curiosity_score),
+        "Power Words": int(power_score),
+        "Keyword Match": int(keyword_score),
+    }
+    return total, parts, suggestions
+
+
+def _description_score(description: str, keyword_hints: List[str]) -> Tuple[int, Dict[str, int], List[str]]:
+    text = description.strip()
+    lower = text.lower()
+    length = len(text)
+
+    length_score = 30 if 400 <= length <= 1800 else max(6, 30 - int(abs(length - 900) / 80))
+    cta_score = 20 if any(x in lower for x in ["subscribe", "comment", "watch", "join", "follow", "link"]) else 5
+    keyword_matches = sum(1 for k in keyword_hints[:15] if k in lower)
+    keyword_score = min(25, keyword_matches * 4)
+    structure_score = 15 if "\n" in text else 8
+    hashtags = re.findall(r"#\w+", text)
+    hashtag_score = 10 if 1 <= len(hashtags) <= 3 else 4
+
+    total = max(0, min(100, length_score + cta_score + keyword_score + structure_score + hashtag_score))
+
+    tips = []
+    if length < 300:
+        tips.append("Description is short; add context, value bullets, and timestamps if possible.")
+    if cta_score < 20:
+        tips.append("Add a clear CTA (subscribe, watch next, comment).")
+    if keyword_score < 8 and keyword_hints:
+        tips.append(f"Add relevant keywords: {', '.join(keyword_hints[:5])}.")
+    if hashtag_score < 10:
+        tips.append("Use 1-3 relevant hashtags, not more.")
+
+    parts = {
+        "Length": int(length_score),
+        "CTA": int(cta_score),
+        "Keywords": int(keyword_score),
+        "Structure": int(structure_score),
+        "Hashtags": int(hashtag_score),
+    }
+    return total, parts, tips
+
+
+def _compute_channel_audit(df: pd.DataFrame) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    ordered = df.sort_values("video_publishedAt").copy()
+
+    out["videos"] = len(ordered)
+    out["median_views"] = float(ordered["views"].median()) if not ordered.empty else 0
+    out["avg_engagement"] = float(ordered["engagement_rate"].mean()) if not ordered.empty else 0
+    out["shorts_ratio"] = float(ordered["is_short"].mean()) if not ordered.empty else 0
+
+    if len(ordered) > 2:
+        gaps = ordered["video_publishedAt"].diff().dt.total_seconds().dropna() / 86400
+        mean_gap = float(gaps.mean()) if not gaps.empty else 0
+        std_gap = float(gaps.std()) if not gaps.empty else 0
+        consistency = max(0.0, 100 - (std_gap / max(mean_gap, 1)) * 40)
+    else:
+        mean_gap = 0
+        consistency = 0
+
+    out["avg_upload_gap_days"] = mean_gap
+    out["consistency_score"] = float(consistency)
+
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+    previous_cutoff = datetime.now(timezone.utc) - timedelta(days=180)
+    recent = ordered[ordered["video_publishedAt"] >= recent_cutoff]
+    previous = ordered[(ordered["video_publishedAt"] < recent_cutoff) & (ordered["video_publishedAt"] >= previous_cutoff)]
+
+    recent_avg = float(recent["views"].mean()) if not recent.empty else 0
+    previous_avg = float(previous["views"].mean()) if not previous.empty else 0
+    growth = ((recent_avg - previous_avg) / previous_avg * 100) if previous_avg > 0 else 0
+    out["view_growth_90d_pct"] = growth
+
+    threshold = max(float(ordered["views"].median()) * 2.0, 1.0)
+    out["outlier_rate"] = float((ordered["views"] >= threshold).mean()) if not ordered.empty else 0
+
     return out
 
 
@@ -306,7 +518,7 @@ def _fetch_or_get_cached_channel(
     if not uploads_pid:
         raise RuntimeError("Channel uploads playlist not found.")
 
-    video_ids = _fetch_recent_video_ids(youtube, uploads_pid, cutoff, max_videos=500)
+    video_ids = _fetch_recent_video_ids(youtube, uploads_pid, cutoff, max_videos=600)
     if not video_ids:
         if not cached.empty:
             title = cached["channel_title"].dropna().iloc[0] if "channel_title" in cached.columns else channel_id
@@ -348,6 +560,7 @@ def _gemini_generate_text(gemini_key: str, model: str, prompt: str) -> str:
     response = requests.post(endpoint, json=payload, timeout=90)
     if response.status_code >= 400:
         raise RuntimeError(f"Gemini text API error ({response.status_code}): {response.text[:500]}")
+
     body = response.json()
     texts: List[str] = []
     for candidate in body.get("candidates", []):
@@ -355,71 +568,13 @@ def _gemini_generate_text(gemini_key: str, model: str, prompt: str) -> str:
             txt = part.get("text")
             if txt:
                 texts.append(txt)
+
     if not texts:
         raise RuntimeError("Gemini did not return text output.")
     return "\n\n".join(texts)
 
 
-def render() -> None:
-    st.title("Ytuber")
-    if build is None:
-        st.error("Missing dependency: google-api-python-client. Install with: python3 -m pip install google-api-python-client")
-        return
-    st.write(
-        "Live + cached YouTube channel intelligence. "
-        "Checks local dataset first; fetches from YouTube API only when needed or forced."
-    )
-
-    youtube_api_key = st.text_input(
-        "YouTube API Key",
-        value=os.getenv("YOUTUBE_API_KEY", ""),
-        type="password",
-    )
-    channel_query = st.text_input("Channel handle / name / channel ID", value="@veritasium")
-    force_refresh = st.checkbox("Force API refresh (ignore cache)", value=False)
-
-    analyze = st.button("Analyze Last 1 Year", type="primary", use_container_width=True)
-
-    if analyze:
-        if not youtube_api_key.strip():
-            st.error("YouTube API key is required.")
-            return
-        if not channel_query.strip():
-            st.error("Enter a channel handle or ID.")
-            return
-
-        with st.spinner("Loading channel data..."):
-            try:
-                channel_df, source, channel_id, channel_title = _fetch_or_get_cached_channel(
-                    channel_query=channel_query.strip(),
-                    youtube_api_key=youtube_api_key.strip(),
-                    force_refresh=force_refresh,
-                )
-            except Exception as exc:
-                st.error(f"Failed to load channel data: {exc}")
-                return
-
-        st.session_state["ytuber_channel_df"] = channel_df
-        st.session_state["ytuber_channel_title"] = channel_title
-        st.session_state["ytuber_channel_id"] = channel_id
-        st.session_state["ytuber_source"] = source
-
-    if "ytuber_channel_df" not in st.session_state:
-        st.info("Run analysis for a channel to see live stats and recommendations.")
-        return
-
-    channel_df = st.session_state["ytuber_channel_df"]
-    channel_title = st.session_state.get("ytuber_channel_title", "")
-    channel_id = st.session_state.get("ytuber_channel_id", "")
-    source = st.session_state.get("ytuber_source", "")
-
-    if channel_df.empty:
-        st.warning("No videos available for this channel in the last year.")
-        return
-
-    st.success(f"Loaded `{channel_title}` ({channel_id}) from `{source}`")
-
-    channel_df = _ensure_numeric_and_dates(channel_df)
+def _render_overview(channel_df: pd.DataFrame) -> None:
     total_videos = len(channel_df)
     total_views = int(channel_df["views"].fillna(0).sum())
     total_likes = int(channel_df["likes"].fillna(0).sum())
@@ -445,67 +600,301 @@ def render() -> None:
             .reset_index()
             .sort_values("publish_month")
         )
-        st.line_chart(trend.set_index("publish_month")[["videos", "views"]], height=320)
+        st.line_chart(trend.set_index("publish_month")[ ["videos", "views"] ], height=320)
 
     with right:
-        st.subheader("Top 10 Videos (Last 1 Year)")
+        st.subheader("Top 12 Videos")
         top_videos = channel_df[
             ["video_title", "views", "likes", "comments", "engagement_rate", "video_publishedAt", "video_id"]
-        ].sort_values("views", ascending=False).head(10)
+        ].sort_values("views", ascending=False).head(12)
         st.dataframe(top_videos, use_container_width=True)
 
-    st.subheader("Detailed Analysis")
-    best = channel_df.sort_values("views", ascending=False).head(20)
-    top_keywords = []
-    for t in best["video_title"].fillna("").astype(str).tolist():
-        top_keywords.extend([w.lower() for w in t.replace("-", " ").split() if len(w) > 3])
-    kw_series = pd.Series(top_keywords)
-    keywords = kw_series.value_counts().head(10).index.tolist() if not kw_series.empty else []
 
-    st.markdown(
-        f"- Best-performing window: `{best['video_publishedAt'].min()}` to `{best['video_publishedAt'].max()}`\n"
-        f"- Top repeated title keywords: `{', '.join(keywords) if keywords else 'N/A'}`\n"
-        f"- Recommendation: target formats similar to top 20 videos and retain high-contrast thumbnail patterns."
+def _render_channel_audit(channel_df: pd.DataFrame) -> None:
+    st.subheader("Channel Audit")
+    audit = _compute_channel_audit(channel_df)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Consistency Score", f"{audit['consistency_score']:.1f}/100")
+    c2.metric("Avg Upload Gap", f"{audit['avg_upload_gap_days']:.1f} days")
+    c3.metric("90d View Growth", f"{audit['view_growth_90d_pct']:.1f}%")
+    c4.metric("Outlier Rate", f"{audit['outlier_rate'] * 100:.1f}%")
+
+    st.markdown("**Audit Notes**")
+    notes = []
+    if audit["consistency_score"] < 45:
+        notes.append("Upload cadence is inconsistent. Use a fixed weekly posting pattern.")
+    if audit["view_growth_90d_pct"] < 0:
+        notes.append("Views are down vs previous 90 days. Test stronger hooks and tighter titles.")
+    if audit["outlier_rate"] < 0.08:
+        notes.append("Few breakout videos detected. Increase experimentation with bold concepts.")
+    if audit["shorts_ratio"] > 0.7:
+        notes.append("Channel is heavily shorts-weighted; blend long-form to deepen session time.")
+    if not notes:
+        notes.append("Performance is stable. Focus on scaling repeatable winning formats.")
+
+    for item in notes:
+        st.write(f"- {item}")
+
+
+def _render_keyword_intel(channel_df: pd.DataFrame) -> List[str]:
+    st.subheader("Keyword Intelligence")
+    intel = _keyword_intel(channel_df)
+    if intel.empty:
+        st.info("Not enough text data to compute keyword insights.")
+        return []
+
+    st.dataframe(intel, use_container_width=True)
+
+    top10 = intel.head(10)["keyword"].tolist()
+    st.markdown("**High-opportunity keywords:** " + ", ".join(top10))
+    return intel["keyword"].tolist()
+
+
+def _render_title_seo_lab(keyword_hints: List[str]) -> None:
+    st.subheader("Title & SEO Lab")
+    test_title = st.text_input("Test title", value="The Hidden Physics Trick That Changes Everything")
+    test_desc = st.text_area(
+        "Test description",
+        value="In this video we break down the science, show real examples, and explain how to apply this idea. Subscribe for more! #science #learning",
+        height=120,
     )
 
+    title_score, parts, tips = _title_score(test_title, keyword_hints)
+    st.metric("Title Score", f"{title_score}/100")
+    st.progress(min(max(title_score, 0), 100) / 100)
+    st.dataframe(pd.DataFrame([parts]), use_container_width=True)
+    for t in tips:
+        st.write(f"- {t}")
+
     st.markdown("---")
-    st.subheader("Gemini Creative Studio")
+
+    desc_score, desc_parts, desc_tips = _description_score(test_desc, keyword_hints)
+    st.metric("Description Score", f"{desc_score}/100")
+    st.progress(min(max(desc_score, 0), 100) / 100)
+    st.dataframe(pd.DataFrame([desc_parts]), use_container_width=True)
+    for t in desc_tips:
+        st.write(f"- {t}")
+
+
+def _render_competitor_benchmark(youtube_api_key: str) -> None:
+    st.subheader("Competitor Benchmark")
+    handles = st.text_area(
+        "Competitor handles (comma separated)",
+        value="@3blue1brown,@veritasium,@smartereveryday",
+        height=90,
+    )
+
+    run = st.button("Run Competitor Benchmark", use_container_width=True)
+    if not run:
+        st.caption("Enter competitor handles and run benchmark.")
+        return
+
+    if not youtube_api_key.strip():
+        st.error("YouTube API key required for competitor benchmarking.")
+        return
+
+    competitors = [h.strip() for h in handles.split(",") if h.strip()]
+    rows = []
+
+    with st.spinner("Loading competitor channels..."):
+        for handle in competitors:
+            try:
+                cdf, source, cid, title = _fetch_or_get_cached_channel(handle, youtube_api_key.strip(), force_refresh=False)
+                cdf = _ensure_numeric_and_dates(cdf)
+                rows.append(
+                    {
+                        "handle": handle,
+                        "channel_title": title,
+                        "channel_id": cid,
+                        "source": source,
+                        "videos_1y": len(cdf),
+                        "total_views": int(cdf["views"].fillna(0).sum()) if not cdf.empty else 0,
+                        "avg_views": int(cdf["views"].fillna(0).mean()) if not cdf.empty else 0,
+                        "median_engagement": float(cdf["engagement_rate"].median()) if not cdf.empty else 0.0,
+                    }
+                )
+            except Exception as exc:
+                rows.append(
+                    {
+                        "handle": handle,
+                        "channel_title": "ERROR",
+                        "channel_id": "",
+                        "source": "error",
+                        "videos_1y": 0,
+                        "total_views": 0,
+                        "avg_views": 0,
+                        "median_engagement": 0.0,
+                        "error": str(exc),
+                    }
+                )
+
+    if not rows:
+        st.warning("No competitor data produced.")
+        return
+
+    bdf = pd.DataFrame(rows).sort_values("total_views", ascending=False)
+    st.dataframe(bdf, use_container_width=True)
+
+
+def _render_trend_radar(channel_df: pd.DataFrame) -> None:
+    st.subheader("Trend Radar")
+    now = datetime.now(timezone.utc)
+    recent_60 = channel_df[channel_df["video_publishedAt"] >= (now - timedelta(days=60))]
+    prev_60 = channel_df[
+        (channel_df["video_publishedAt"] < (now - timedelta(days=60)))
+        & (channel_df["video_publishedAt"] >= (now - timedelta(days=120)))
+    ]
+
+    def keyword_counter(frame: pd.DataFrame) -> Counter:
+        c = Counter()
+        for title in frame["video_title"].fillna("").astype(str):
+            c.update(set(_tokenize(title)))
+        return c
+
+    c_recent = keyword_counter(recent_60)
+    c_prev = keyword_counter(prev_60)
+
+    rows = []
+    for kw, recent_count in c_recent.items():
+        prev_count = c_prev.get(kw, 0)
+        growth = recent_count - prev_count
+        rows.append(
+            {
+                "keyword": kw,
+                "recent_mentions": recent_count,
+                "previous_mentions": prev_count,
+                "momentum_delta": growth,
+            }
+        )
+
+    tdf = pd.DataFrame(rows)
+    if tdf.empty:
+        st.info("Not enough recent data for trend radar.")
+        return
+
+    tdf = tdf.sort_values(["momentum_delta", "recent_mentions"], ascending=[False, False]).head(25)
+    st.dataframe(tdf, use_container_width=True)
+
+
+def _render_content_planner(channel_df: pd.DataFrame) -> None:
+    st.subheader("Content Planner")
+
+    day_perf = (
+        channel_df.groupby("publish_day", dropna=False)
+        .agg(avg_views=("views", "mean"), median_engagement=("engagement_rate", "median"), videos=("video_id", "count"))
+        .reset_index()
+        .sort_values("avg_views", ascending=False)
+    )
+
+    hour_perf = (
+        channel_df.groupby("publish_hour", dropna=False)
+        .agg(avg_views=("views", "mean"), median_engagement=("engagement_rate", "median"), videos=("video_id", "count"))
+        .reset_index()
+        .sort_values("avg_views", ascending=False)
+    )
+
+    best_day = day_perf.iloc[0]["publish_day"] if not day_perf.empty else "Wednesday"
+    best_hour = int(hour_perf.iloc[0]["publish_hour"]) if not hour_perf.empty else 15
+
+    c1, c2 = st.columns(2)
+    c1.metric("Best Publishing Day", str(best_day))
+    c2.metric("Best Publishing Hour (UTC)", f"{best_hour:02d}:00")
+
+    st.markdown("**Day Performance**")
+    st.dataframe(day_perf, use_container_width=True)
+
+    st.markdown("**Hour Performance (UTC)**")
+    st.dataframe(hour_perf.head(12), use_container_width=True)
+
+    top_topics = _top_keywords(channel_df, top_n=12)
+    st.markdown("**Suggested next content angles:** " + ", ".join(top_topics[:8]))
+
+    weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    weekday_map = {d: i for i, d in enumerate(weekday_order)}
+    target_weekday = weekday_map.get(best_day, 2)
+
+    start = datetime.now(timezone.utc)
+    plan_rows = []
+    cursor = start
+    for i in range(1, 5):
+        while cursor.weekday() != target_weekday:
+            cursor += timedelta(days=1)
+        plan_rows.append(
+            {
+                "week": f"Week {i}",
+                "publish_date_utc": cursor.date().isoformat(),
+                "publish_time_utc": f"{best_hour:02d}:00",
+                "topic_hint": top_topics[(i - 1) % max(len(top_topics), 1)] if top_topics else "core topic",
+            }
+        )
+        cursor += timedelta(days=7)
+
+    st.markdown("**4-Week Suggested Calendar**")
+    st.dataframe(pd.DataFrame(plan_rows), use_container_width=True)
+
+
+def _render_ai_studio(
+    channel_df: pd.DataFrame,
+    channel_title: str,
+    channel_id: str,
+    keyword_hints: List[str],
+) -> None:
+    st.subheader("AI Studio")
 
     gemini_key = st.text_input("Gemini API Key", value=os.getenv("GEMINI_API_KEY", ""), type="password")
     text_model = st.text_input("Gemini text model", value="gemini-2.0-flash")
     image_model = st.text_input("Gemini image model", value="gemini-2.0-flash-preview-image-generation")
 
-    creative_prompt = st.text_area(
+    creative_brief = st.text_area(
         "Creative brief",
-        value=(
-            f"Channel: {channel_title}. Create high-performing content ideas for the next month based on this channel's recent stats."
-        ),
+        value=f"Channel: {channel_title}. Create high-performing science content for next month.",
         height=100,
     )
 
+    output_type = st.selectbox(
+        "Creative task",
+        [
+            "Full Pack (titles + descriptions + scripts + thumbnail concepts)",
+            "Titles Only",
+            "Descriptions Only",
+            "Scripts Only",
+            "Hooks + CTAs",
+        ],
+        index=0,
+    )
+
     col_a, col_b = st.columns(2)
-    gen_text = col_a.button("Generate Titles/Descriptions/Scripts", use_container_width=True)
+    gen_text = col_a.button("Generate AI Content", use_container_width=True)
     gen_thumb = col_b.button("Generate Thumbnail Images", use_container_width=True)
+
+    total_videos = len(channel_df)
+    total_views = int(channel_df["views"].fillna(0).sum())
+    avg_views = int(channel_df["views"].fillna(0).mean())
+    med_eng = float(channel_df["engagement_rate"].median() * 100)
 
     if gen_text:
         if not gemini_key.strip():
-            st.error("Gemini API key is required for creative generation.")
+            st.error("Gemini API key is required for AI content.")
         else:
             prompt = (
-                f"You are a YouTube strategist. Based on this channel data summary:\n"
-                f"Videos last year: {total_videos}, total views: {total_views}, avg views/video: {avg_views}, median engagement: {med_eng:.2f}%\n"
-                f"Top title keywords: {', '.join(keywords)}\n"
-                f"Brief: {creative_prompt}\n\n"
-                "Return:\n"
-                "1) 12 title ideas\n"
-                "2) 5 full descriptions\n"
-                "3) 3 short script outlines (hook, body bullets, CTA)\n"
-                "4) 8 thumbnail concepts (visual direction, text overlay, color/subject)\n"
+                "You are an advanced YouTube strategist. "
+                "Produce concise, high-performing outputs grounded in these channel stats.\n\n"
+                f"Channel: {channel_title} ({channel_id})\n"
+                f"Videos(1y): {total_videos}, Total views: {total_views}, Avg views/video: {avg_views}, Median engagement: {med_eng:.2f}%\n"
+                f"Priority keywords: {', '.join(keyword_hints[:15])}\n"
+                f"Task: {output_type}\n"
+                f"Brief: {creative_brief}\n\n"
+                "When relevant include:\n"
+                "- strong hooks\n"
+                "- clear structure\n"
+                "- search intent alignment\n"
+                "- simple CTA\n"
             )
-            with st.spinner("Calling Gemini for creative assets..."):
+            with st.spinner("Calling Gemini..."):
                 try:
-                    creative_text = _gemini_generate_text(gemini_key.strip(), text_model.strip(), prompt)
-                    st.text_area("Gemini Output", value=creative_text, height=420)
+                    output = _gemini_generate_text(gemini_key.strip(), text_model.strip(), prompt)
+                    st.text_area("AI Output", value=output, height=460)
                 except Exception as exc:
                     st.error(f"Gemini generation failed: {exc}")
 
@@ -514,19 +903,20 @@ def render() -> None:
             st.error("Gemini API key is required for thumbnail generation.")
         else:
             base_title = channel_df.sort_values("views", ascending=False).head(1)["video_title"].iloc[0]
-            with st.spinner("Generating thumbnails with Gemini image model..."):
+            with st.spinner("Generating thumbnails..."):
                 try:
                     generator = ThumbnailGenerator(provider="gemini", api_key=gemini_key.strip(), model=image_model.strip())
                     images = generator.generate(
                         title=f"Inspired by: {base_title}",
-                        context=creative_prompt,
-                        style="High contrast, clean focal subject, bold science visual, 16:9",
-                        negative_prompt="low contrast, clutter, tiny text",
-                        count=2,
+                        context=creative_brief,
+                        style="High contrast, one clear subject, bold science aesthetic, 16:9 composition",
+                        negative_prompt="clutter, tiny text, low contrast",
+                        count=3,
                     )
                     out_dir = os.path.join("outputs", "thumbnails")
                     os.makedirs(out_dir, exist_ok=True)
                     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
                     for idx, generated in enumerate(images, start=1):
                         st.image(generated.image_bytes, caption=f"Ytuber Thumbnail {idx}")
                         ext = "png" if "png" in generated.mime_type else "jpg"
@@ -538,8 +928,105 @@ def render() -> None:
                             data=generated.image_bytes,
                             file_name=filename,
                             mime=generated.mime_type,
-                            key=f"ytuber_dl_{idx}_{ts}",
+                            key=f"ytuber_thumb_{idx}_{ts}",
                             use_container_width=True,
                         )
                 except Exception as exc:
                     st.error(f"Thumbnail generation failed: {exc}")
+
+
+def render() -> None:
+    st.title("Ytuber")
+    if build is None:
+        st.error("Missing dependency: google-api-python-client. Install with: python3 -m pip install google-api-python-client")
+        return
+
+    st.caption(
+        "Creator Suite: cache-aware channel sync, analytics, SEO tooling, competitor tracking, trend radar, planner, and AI studio."
+    )
+
+    youtube_api_key = st.text_input("YouTube API Key", value=os.getenv("YOUTUBE_API_KEY", ""), type="password")
+    channel_query = st.text_input("Channel handle / name / channel ID", value="@veritasium")
+    force_refresh = st.checkbox("Force API refresh (ignore cache)", value=False)
+
+    analyze = st.button("Load Channel (Last 1 Year)", type="primary", use_container_width=True)
+
+    if analyze:
+        if not youtube_api_key.strip():
+            st.error("YouTube API key is required.")
+            return
+        if not channel_query.strip():
+            st.error("Enter a channel handle or ID.")
+            return
+
+        with st.spinner("Loading channel data from cache/API..."):
+            try:
+                channel_df, source, channel_id, channel_title = _fetch_or_get_cached_channel(
+                    channel_query=channel_query.strip(),
+                    youtube_api_key=youtube_api_key.strip(),
+                    force_refresh=force_refresh,
+                )
+            except Exception as exc:
+                st.error(f"Failed to load channel data: {exc}")
+                return
+
+        st.session_state["ytuber_channel_df"] = channel_df
+        st.session_state["ytuber_channel_title"] = channel_title
+        st.session_state["ytuber_channel_id"] = channel_id
+        st.session_state["ytuber_source"] = source
+
+    if "ytuber_channel_df" not in st.session_state:
+        st.info("Load a channel to unlock the full Ytuber suite.")
+        return
+
+    channel_df = st.session_state["ytuber_channel_df"]
+    channel_title = st.session_state.get("ytuber_channel_title", "")
+    channel_id = st.session_state.get("ytuber_channel_id", "")
+    source = st.session_state.get("ytuber_source", "")
+
+    if channel_df.empty:
+        st.warning("No videos available for this channel in the last year.")
+        return
+
+    channel_df = _ensure_numeric_and_dates(channel_df)
+    st.success(f"Loaded `{channel_title}` ({channel_id}) from `{source}`")
+
+    tabs = st.tabs(
+        [
+            "Overview",
+            "Channel Audit",
+            "Keyword Intel",
+            "Title & SEO Lab",
+            "Competitor Benchmark",
+            "Trend Radar",
+            "Content Planner",
+            "AI Studio",
+        ]
+    )
+
+    with tabs[0]:
+        _render_overview(channel_df)
+
+    with tabs[1]:
+        _render_channel_audit(channel_df)
+
+    with tabs[2]:
+        keyword_hints = _render_keyword_intel(channel_df)
+        st.session_state["ytuber_keyword_hints"] = keyword_hints
+
+    with tabs[3]:
+        hints = st.session_state.get("ytuber_keyword_hints") or _top_keywords(channel_df, 20)
+        _render_title_seo_lab(hints)
+
+    with tabs[4]:
+        _render_competitor_benchmark(youtube_api_key)
+
+    with tabs[5]:
+        _render_trend_radar(channel_df)
+
+    with tabs[6]:
+        _render_content_planner(channel_df)
+
+    with tabs[7]:
+        hints = st.session_state.get("ytuber_keyword_hints") or _top_keywords(channel_df, 20)
+        _render_ai_studio(channel_df, channel_title, channel_id, hints)
