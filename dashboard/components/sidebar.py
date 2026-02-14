@@ -14,5 +14,5 @@ def render_sidebar() -> str:
         "Set `YOUTUBE_API_KEY` and `GEMINI_API_KEY` in `.env` for full Ytuber functionality."
     )
     st.sidebar.markdown("---")
-    st.sidebar.caption("Made with love from Ayush")
+    st.sidebar.caption("Under experimentation by Ayush")
     return page
