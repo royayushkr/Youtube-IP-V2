@@ -8,7 +8,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dashboard.components.sidebar import render_sidebar
-from dashboard.pages import channel_analysis, recommendations
+from dashboard.views import channel_analysis, recommendations, ytuber
 
 
 st.set_page_config(page_title="YouTube IP Dashboard", page_icon="📺", layout="wide")
@@ -16,17 +16,20 @@ st.set_page_config(page_title="YouTube IP Dashboard", page_icon="📺", layout="
 
 page = render_sidebar()
 
-if page == "Thumbnail Generator":
-    recommendations.render()
-elif page == "Dataset Overview":
+if page == "Channel Analysis":
     channel_analysis.render()
+elif page == "Recommendations":
+    recommendations.render()
+elif page == "Ytuber":
+    ytuber.render()
 else:
     st.title("Deploy Notes")
     st.markdown(
         """
         ### Environment Variables
-        - `GEMINI_API_KEY` for Gemini image generation
-        - `OPENAI_API_KEY` for OpenAI image generation fallback
+        - `YOUTUBE_API_KEY` for channel stats pull
+        - `GEMINI_API_KEY` for titles/descriptions/scripts/thumbnails
+        - `OPENAI_API_KEY` optional fallback for thumbnail generation
 
         ### Local Run
         ```bash
@@ -37,6 +40,6 @@ else:
         ### Streamlit Cloud
         1. Push this repo to GitHub.
         2. Create a new Streamlit app with entrypoint `dashboard/app.py`.
-        3. Add secrets `GEMINI_API_KEY` and/or `OPENAI_API_KEY`.
+        3. Add secrets for required API keys.
         """
     )
