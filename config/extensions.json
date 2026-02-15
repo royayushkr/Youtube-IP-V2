@@ -1,6 +1,6 @@
 {
   "Home": true,
-  "Channel Analysis": true,
+  "Channel Analysis": false,
   "Recommendations": true,
   "Ytuber": true,
   "Extension Center": true,
