@@ -1,3 +1,6 @@
+import base64
+import io
+import json
 import os
 import re
 import time
@@ -8,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+from PIL import Image, ImageStat
 
 try:
     from googleapiclient.discovery import build
@@ -16,10 +20,21 @@ except Exception:
     build = None
     HttpError = Exception
 
+try:
+    from pytrends.request import TrendReq
+except Exception:
+    TrendReq = None
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+except Exception:
+    YouTubeTranscriptApi = None
+
 from src.llm_integration.thumbnail_generator import ThumbnailGenerator
 
 
 DATASET_PATH = os.path.join("data", "youtube api data", "research_science_channels_videos.csv")
+BRAND_KIT_PATH = os.path.join("config", "brand_kit.json")
 DEFAULT_CATEGORY = "research_science"
 THUMB_KEYS = ["default", "medium", "high", "standard", "maxres"]
 STOPWORDS = {
@@ -29,6 +44,12 @@ STOPWORDS = {
 POWER_WORDS = {
     "secret", "ultimate", "proven", "easy", "fast", "best", "shocking", "truth", "mistake", "science",
     "future", "breakthrough", "insane", "new", "critical", "warning", "guide", "explained", "hidden", "top",
+}
+POSITIVE_WORDS = {
+    "great", "amazing", "awesome", "helpful", "love", "excellent", "perfect", "best", "clear", "fantastic", "cool",
+}
+NEGATIVE_WORDS = {
+    "bad", "boring", "confusing", "worse", "worst", "hate", "useless", "clickbait", "slow", "poor", "terrible",
 }
 
 
@@ -169,6 +190,31 @@ def _fetch_videos_details(youtube, video_ids: List[str]) -> List[Dict[str, Any]]
     return out
 
 
+def _fetch_video_comments(youtube, video_id: str, max_comments: int = 100) -> List[str]:
+    out: List[str] = []
+    token: Optional[str] = None
+
+    while len(out) < max_comments:
+        req = youtube.commentThreads().list(
+            part="snippet",
+            videoId=video_id,
+            textFormat="plainText",
+            maxResults=min(100, max_comments - len(out)),
+            pageToken=token,
+            order="relevance",
+        )
+        resp = _api_call_with_backoff(req.execute)
+        items = resp.get("items", [])
+        for item in items:
+            text = _safe_get(item, ["snippet", "topLevelComment", "snippet", "textDisplay"], "")
+            if text:
+                out.append(str(text))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return out
+
+
 def _extract_thumbnails(thumbnails: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if not isinstance(thumbnails, dict):
@@ -304,6 +350,7 @@ def _ensure_numeric_and_dates(df: pd.DataFrame) -> pd.DataFrame:
     out["publish_hour"] = out["video_publishedAt"].dt.hour
     out["duration_seconds"] = out["duration"].fillna("").astype(str).map(_parse_iso_duration_seconds)
     out["is_short"] = out["duration_seconds"] <= 60
+    out["title_length"] = out["video_title"].fillna("").astype(str).str.len()
     return out
 
 
@@ -491,6 +538,33 @@ def _compute_channel_audit(df: pd.DataFrame) -> Dict[str, Any]:
     return out
 
 
+def _load_brand_kit() -> Dict[str, Any]:
+    default = {
+        "brand_name": "Ayush Creator Lab",
+        "tone": "Direct, curious, insight-driven",
+        "audience": "Ambitious learners and creators",
+        "visual_style": "High contrast, bold focal subject, clean scientific style",
+        "banned_words": ["cheap", "fake", "impossible"],
+        "cta_style": "Invite viewers to test and comment",
+    }
+    if not os.path.exists(BRAND_KIT_PATH):
+        return default
+    try:
+        with open(BRAND_KIT_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        merged = default.copy()
+        merged.update(data)
+        return merged
+    except Exception:
+        return default
+
+
+def _save_brand_kit(kit: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(BRAND_KIT_PATH), exist_ok=True)
+    with open(BRAND_KIT_PATH, "w", encoding="utf-8") as fp:
+        json.dump(kit, fp, indent=2)
+
+
 def _fetch_or_get_cached_channel(
     channel_query: str,
     youtube_api_key: str,
@@ -574,6 +648,42 @@ def _gemini_generate_text(gemini_key: str, model: str, prompt: str) -> str:
     return "\n\n".join(texts)
 
 
+def _gemini_vision_review(gemini_key: str, model: str, image_bytes: bytes, prompt: str) -> str:
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        f"?key={gemini_key}"
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(image_bytes).decode("utf-8"),
+                        }
+                    },
+                ]
+            }
+        ]
+    }
+    response = requests.post(endpoint, json=payload, timeout=90)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Gemini vision API error ({response.status_code}): {response.text[:500]}")
+    body = response.json()
+
+    texts: List[str] = []
+    for candidate in body.get("candidates", []):
+        for part in _safe_get(candidate, ["content", "parts"], []) or []:
+            txt = part.get("text")
+            if txt:
+                texts.append(txt)
+    if not texts:
+        raise RuntimeError("Gemini vision returned no text output.")
+    return "\n\n".join(texts)
+
+
 def _render_overview(channel_df: pd.DataFrame) -> None:
     total_videos = len(channel_df)
     total_views = int(channel_df["views"].fillna(0).sum())
@@ -600,7 +710,7 @@ def _render_overview(channel_df: pd.DataFrame) -> None:
             .reset_index()
             .sort_values("publish_month")
         )
-        st.line_chart(trend.set_index("publish_month")[ ["videos", "views"] ], height=320)
+        st.line_chart(trend.set_index("publish_month")[["videos", "views"]], height=320)
 
     with right:
         st.subheader("Top 12 Videos")
@@ -645,7 +755,6 @@ def _render_keyword_intel(channel_df: pd.DataFrame) -> List[str]:
         return []
 
     st.dataframe(intel, use_container_width=True)
-
     top10 = intel.head(10)["keyword"].tolist()
     st.markdown("**High-opportunity keywords:** " + ", ".join(top10))
     return intel["keyword"].tolist()
@@ -675,6 +784,46 @@ def _render_title_seo_lab(keyword_hints: List[str]) -> None:
     st.dataframe(pd.DataFrame([desc_parts]), use_container_width=True)
     for t in desc_tips:
         st.write(f"- {t}")
+
+
+def _render_title_ab_lab(keyword_hints: List[str], gemini_key: str, text_model: str) -> None:
+    st.subheader("Title A/B Lab")
+    base_title = st.text_input("Base title", value="This Physics Experiment Broke My Brain")
+    variant_count = st.slider("Variants", min_value=5, max_value=30, value=12)
+
+    run = st.button("Generate A/B Variants", use_container_width=True)
+    if not run:
+        return
+
+    variants: List[str] = []
+    if gemini_key.strip():
+        prompt = (
+            f"Generate {variant_count} distinct YouTube title variants for this base title:\n"
+            f"{base_title}\n\n"
+            f"Use these keywords when relevant: {', '.join(keyword_hints[:15])}\n"
+            "Return one title per line only."
+        )
+        try:
+            raw = _gemini_generate_text(gemini_key.strip(), text_model.strip(), prompt)
+            lines = [ln.strip(" -0123456789.") for ln in raw.splitlines() if ln.strip()]
+            variants = list(dict.fromkeys(lines))
+        except Exception as exc:
+            st.warning(f"Gemini title generation failed; using heuristic variants. {exc}")
+
+    if not variants:
+        suffixes = [
+            "(Explained)", "in 10 Minutes", "No One Talks About This", "What Happens Next?", "The Science Behind It",
+            "Without The Hype", "The Brutal Truth", "Step by Step", "Beginner to Pro", "Before It’s Too Late",
+        ]
+        variants = [f"{base_title} {suffixes[i % len(suffixes)]}" for i in range(variant_count)]
+
+    rows = []
+    for t in variants[:variant_count]:
+        score, parts, _tips = _title_score(t, keyword_hints)
+        rows.append({"title": t, "score": score, **parts})
+
+    out = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    st.dataframe(out, use_container_width=True)
 
 
 def _render_competitor_benchmark(youtube_api_key: str) -> None:
@@ -737,6 +886,67 @@ def _render_competitor_benchmark(youtube_api_key: str) -> None:
     st.dataframe(bdf, use_container_width=True)
 
 
+def _render_content_gap_finder(channel_df: pd.DataFrame, youtube_api_key: str) -> None:
+    st.subheader("Content Gap Finder")
+    handles = st.text_area(
+        "Compare against competitors (comma separated)",
+        value="@3blue1brown,@smartereveryday,@RealEngineering",
+        height=80,
+    )
+    run = st.button("Find Content Gaps", use_container_width=True)
+    if not run:
+        return
+
+    if not youtube_api_key.strip():
+        st.error("YouTube API key required.")
+        return
+
+    base_keywords = set(_top_keywords(channel_df, 80))
+    competitors = [h.strip() for h in handles.split(",") if h.strip()]
+
+    rows = []
+    with st.spinner("Analyzing competitor topic coverage..."):
+        for handle in competitors:
+            try:
+                cdf, _source, _cid, ctitle = _fetch_or_get_cached_channel(handle, youtube_api_key.strip(), force_refresh=False)
+                cdf = _ensure_numeric_and_dates(cdf)
+                intel = _keyword_intel(cdf, top_n=60)
+                for _, r in intel.iterrows():
+                    kw = str(r["keyword"])
+                    if kw in base_keywords:
+                        continue
+                    rows.append(
+                        {
+                            "keyword": kw,
+                            "competitor": ctitle,
+                            "opportunity_score": float(r["score"]),
+                            "avg_views": float(r["avg_views"]),
+                            "avg_engagement": float(r["avg_engagement"]),
+                        }
+                    )
+            except Exception:
+                continue
+
+    if not rows:
+        st.info("No clear gaps found from selected competitors.")
+        return
+
+    gdf = pd.DataFrame(rows)
+    out = (
+        gdf.groupby("keyword", dropna=False)
+        .agg(
+            opportunity_score=("opportunity_score", "mean"),
+            avg_views=("avg_views", "mean"),
+            avg_engagement=("avg_engagement", "mean"),
+            competitor_count=("competitor", "nunique"),
+        )
+        .reset_index()
+        .sort_values("opportunity_score", ascending=False)
+        .head(40)
+    )
+    st.dataframe(out, use_container_width=True)
+
+
 def _render_trend_radar(channel_df: pd.DataFrame) -> None:
     st.subheader("Trend Radar")
     now = datetime.now(timezone.utc)
@@ -775,6 +985,73 @@ def _render_trend_radar(channel_df: pd.DataFrame) -> None:
 
     tdf = tdf.sort_values(["momentum_delta", "recent_mentions"], ascending=[False, False]).head(25)
     st.dataframe(tdf, use_container_width=True)
+
+
+def _render_trend_api(keyword_hints: List[str]) -> None:
+    st.subheader("Trend APIs")
+    seed = ", ".join(keyword_hints[:5]) if keyword_hints else "science, physics, engineering"
+    keywords = st.text_input("Trend keywords (comma separated, max 5)", value=seed)
+    news_api_key = st.text_input("News API key (optional)", value=os.getenv("NEWSAPI_KEY", ""), type="password")
+
+    klist = [k.strip() for k in keywords.split(",") if k.strip()][:5]
+    c1, c2 = st.columns(2)
+    run_trends = c1.button("Fetch Google Trends", use_container_width=True)
+    run_news = c2.button("Fetch News Signals", use_container_width=True)
+
+    if run_trends:
+        if TrendReq is None:
+            st.error("pytrends unavailable in this environment.")
+        elif not klist:
+            st.error("Add at least one keyword.")
+        else:
+            try:
+                pytrend = TrendReq(hl="en-US", tz=360)
+                pytrend.build_payload(klist, timeframe="today 12-m")
+                iot = pytrend.interest_over_time().drop(columns=["isPartial"], errors="ignore")
+                st.line_chart(iot)
+                rq = pytrend.related_queries()
+                primary = klist[0]
+                top_q = _safe_get(rq, [primary, "top"], None)
+                if top_q is not None and not top_q.empty:
+                    st.markdown("**Related Queries**")
+                    st.dataframe(top_q.head(20), use_container_width=True)
+            except Exception as exc:
+                st.error(f"Google Trends fetch failed: {exc}")
+
+    if run_news:
+        if not news_api_key.strip():
+            st.error("News API key is required.")
+        elif not klist:
+            st.error("Add at least one keyword.")
+        else:
+            query = " OR ".join(klist)
+            url = (
+                "https://newsapi.org/v2/everything?"
+                f"q={requests.utils.quote(query)}&sortBy=publishedAt&language=en&pageSize=20&apiKey={news_api_key.strip()}"
+            )
+            try:
+                resp = requests.get(url, timeout=30)
+                if resp.status_code >= 400:
+                    raise RuntimeError(resp.text[:500])
+                body = resp.json()
+                articles = body.get("articles", [])
+                ndf = pd.DataFrame(
+                    [
+                        {
+                            "title": a.get("title", ""),
+                            "source": _safe_get(a, ["source", "name"], ""),
+                            "publishedAt": a.get("publishedAt", ""),
+                            "url": a.get("url", ""),
+                        }
+                        for a in articles
+                    ]
+                )
+                if ndf.empty:
+                    st.info("No recent news found for these keywords.")
+                else:
+                    st.dataframe(ndf, use_container_width=True)
+            except Exception as exc:
+                st.error(f"News API fetch failed: {exc}")
 
 
 def _render_content_planner(channel_df: pd.DataFrame) -> None:
@@ -834,11 +1111,199 @@ def _render_content_planner(channel_df: pd.DataFrame) -> None:
     st.dataframe(pd.DataFrame(plan_rows), use_container_width=True)
 
 
+def _render_thumbnail_critic(gemini_key: str, image_model: str) -> None:
+    st.subheader("Thumbnail Critic")
+    uploaded = st.file_uploader("Upload thumbnail image", type=["png", "jpg", "jpeg"], key="thumb_critic_upload")
+    if not uploaded:
+        st.caption("Upload an image to run quality diagnostics.")
+        return
+
+    image_bytes = uploaded.read()
+    st.image(image_bytes, caption="Uploaded Thumbnail", use_container_width=True)
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        stat = ImageStat.Stat(img)
+        brightness = sum(stat.mean) / 3
+        contrast = sum(stat.stddev) / 3
+        w, h = img.size
+        aspect = w / max(h, 1)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Brightness", f"{brightness:.1f}")
+        c2.metric("Contrast", f"{contrast:.1f}")
+        c3.metric("Aspect Ratio", f"{aspect:.2f}")
+
+        quick_tips = []
+        if brightness < 75:
+            quick_tips.append("Image is dark; increase exposure/highlights for mobile readability.")
+        if contrast < 45:
+            quick_tips.append("Contrast is low; increase foreground/background separation.")
+        if aspect < 1.6 or aspect > 1.9:
+            quick_tips.append("Use 16:9 framing for YouTube thumbnails.")
+        if not quick_tips:
+            quick_tips.append("Technical baseline looks good. Focus on emotional hook and subject clarity.")
+
+        for t in quick_tips:
+            st.write(f"- {t}")
+    except Exception as exc:
+        st.warning(f"Could not compute local image metrics: {exc}")
+
+    run_ai = st.button("Run Gemini Visual Critique", use_container_width=True)
+    if run_ai:
+        if not gemini_key.strip():
+            st.error("Gemini API key required for visual critique.")
+            return
+        prompt = (
+            "Review this YouTube thumbnail. Provide: 1) CTR potential score out of 10, "
+            "2) readability feedback, 3) emotional impact feedback, 4) composition fixes, "
+            "5) improved prompt to regenerate a better version."
+        )
+        try:
+            review = _gemini_vision_review(gemini_key.strip(), image_model.strip(), image_bytes, prompt)
+            st.text_area("Gemini Visual Critique", value=review, height=320)
+        except Exception as exc:
+            st.error(f"Gemini visual critique failed: {exc}")
+
+
+def _render_comment_intelligence(channel_df: pd.DataFrame, youtube_api_key: str) -> None:
+    st.subheader("Comment Intelligence")
+    top_n_videos = st.slider("Top videos to inspect", 1, 10, 5)
+    max_comments = st.slider("Max comments per video", 20, 200, 80)
+
+    run = st.button("Analyze Comments", use_container_width=True)
+    if not run:
+        return
+
+    if not youtube_api_key.strip():
+        st.error("YouTube API key required for comment intelligence.")
+        return
+
+    top_videos = channel_df.sort_values("views", ascending=False).head(top_n_videos)
+    youtube = _yt_client(youtube_api_key.strip())
+
+    comments: List[str] = []
+    with st.spinner("Fetching comments from YouTube API..."):
+        for _, row in top_videos.iterrows():
+            vid = str(row.get("video_id", ""))
+            if not vid:
+                continue
+            try:
+                comments.extend(_fetch_video_comments(youtube, vid, max_comments=max_comments))
+            except Exception:
+                continue
+
+    if not comments:
+        st.info("No comments pulled (comments may be disabled for selected videos).")
+        return
+
+    token_counter = Counter()
+    pos = neg = questions = 0
+    for c in comments:
+        toks = _tokenize(c)
+        token_counter.update(toks)
+        if any(w in c.lower() for w in POSITIVE_WORDS):
+            pos += 1
+        if any(w in c.lower() for w in NEGATIVE_WORDS):
+            neg += 1
+        if "?" in c:
+            questions += 1
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Comments Analyzed", f"{len(comments):,}")
+    c2.metric("Positive Signal", f"{(pos / len(comments) * 100):.1f}%")
+    c3.metric("Negative Signal", f"{(neg / len(comments) * 100):.1f}%")
+    c4.metric("Questions", f"{questions:,}")
+
+    top_terms = pd.DataFrame(token_counter.most_common(30), columns=["term", "count"])
+    st.markdown("**Most frequent comment terms**")
+    st.dataframe(top_terms, use_container_width=True)
+
+
+def _render_transcript_lab(channel_df: pd.DataFrame, gemini_key: str, text_model: str) -> None:
+    st.subheader("Transcript Lab")
+
+    if YouTubeTranscriptApi is None:
+        st.warning("`youtube-transcript-api` is not installed in this environment.")
+        return
+
+    choices = channel_df.sort_values("views", ascending=False).head(30)
+    options = {
+        f"{row['video_title'][:80]} ({row['video_id']})": str(row["video_id"])
+        for _, row in choices.iterrows()
+    }
+    if not options:
+        st.info("No videos available for transcript analysis.")
+        return
+
+    selected_label = st.selectbox("Select video for transcript", list(options.keys()))
+    video_id = options[selected_label]
+
+    run = st.button("Fetch Transcript", use_container_width=True)
+    if not run:
+        return
+
+    try:
+        transcript_items = YouTubeTranscriptApi.get_transcript(video_id)
+        transcript_text = " ".join([it.get("text", "") for it in transcript_items])
+    except Exception as exc:
+        st.error(f"Transcript fetch failed: {exc}")
+        return
+
+    st.metric("Transcript Words", f"{len(transcript_text.split()):,}")
+    st.text_area("Transcript Preview", transcript_text[:8000], height=220)
+
+    if gemini_key.strip():
+        analyze = st.button("Generate Retention & Script Improvements", use_container_width=True)
+        if analyze:
+            prompt = (
+                "Analyze this YouTube transcript and return:\n"
+                "1) Weak retention zones\n"
+                "2) Suggested hook rewrite\n"
+                "3) 5 concise pacing improvements\n"
+                "4) Strong CTA rewrite\n\n"
+                f"Transcript:\n{transcript_text[:25000]}"
+            )
+            try:
+                analysis = _gemini_generate_text(gemini_key.strip(), text_model.strip(), prompt)
+                st.text_area("Transcript Analysis", value=analysis, height=360)
+            except Exception as exc:
+                st.error(f"Gemini transcript analysis failed: {exc}")
+
+
+def _render_brand_kit_manager() -> Dict[str, Any]:
+    st.subheader("Brand Kit")
+    kit = _load_brand_kit()
+
+    brand_name = st.text_input("Brand name", value=str(kit.get("brand_name", "")))
+    tone = st.text_input("Tone", value=str(kit.get("tone", "")))
+    audience = st.text_input("Audience", value=str(kit.get("audience", "")))
+    visual_style = st.text_area("Visual style", value=str(kit.get("visual_style", "")), height=90)
+    banned_words = st.text_input("Banned words (comma separated)", value=", ".join(kit.get("banned_words", [])))
+    cta_style = st.text_input("CTA style", value=str(kit.get("cta_style", "")))
+
+    if st.button("Save Brand Kit", use_container_width=True):
+        updated = {
+            "brand_name": brand_name,
+            "tone": tone,
+            "audience": audience,
+            "visual_style": visual_style,
+            "banned_words": [w.strip() for w in banned_words.split(",") if w.strip()],
+            "cta_style": cta_style,
+        }
+        _save_brand_kit(updated)
+        st.success("Brand kit saved.")
+        kit = updated
+
+    return kit
+
+
 def _render_ai_studio(
     channel_df: pd.DataFrame,
     channel_title: str,
     channel_id: str,
     keyword_hints: List[str],
+    brand_kit: Dict[str, Any],
 ) -> None:
     st.subheader("AI Studio")
 
@@ -878,61 +1343,54 @@ def _render_ai_studio(
             st.error("Gemini API key is required for AI content.")
         else:
             prompt = (
-                "You are an advanced YouTube strategist. "
-                "Produce concise, high-performing outputs grounded in these channel stats.\n\n"
+                "You are an advanced YouTube strategist. Produce concise, high-performing outputs.\n"
                 f"Channel: {channel_title} ({channel_id})\n"
                 f"Videos(1y): {total_videos}, Total views: {total_views}, Avg views/video: {avg_views}, Median engagement: {med_eng:.2f}%\n"
                 f"Priority keywords: {', '.join(keyword_hints[:15])}\n"
+                f"Brand Kit: {json.dumps(brand_kit)}\n"
                 f"Task: {output_type}\n"
-                f"Brief: {creative_brief}\n\n"
-                "When relevant include:\n"
-                "- strong hooks\n"
-                "- clear structure\n"
-                "- search intent alignment\n"
-                "- simple CTA\n"
+                f"Brief: {creative_brief}\n"
             )
-            with st.spinner("Calling Gemini..."):
-                try:
-                    output = _gemini_generate_text(gemini_key.strip(), text_model.strip(), prompt)
-                    st.text_area("AI Output", value=output, height=460)
-                except Exception as exc:
-                    st.error(f"Gemini generation failed: {exc}")
+            try:
+                output = _gemini_generate_text(gemini_key.strip(), text_model.strip(), prompt)
+                st.text_area("AI Output", value=output, height=460)
+            except Exception as exc:
+                st.error(f"Gemini generation failed: {exc}")
 
     if gen_thumb:
         if not gemini_key.strip():
             st.error("Gemini API key is required for thumbnail generation.")
         else:
             base_title = channel_df.sort_values("views", ascending=False).head(1)["video_title"].iloc[0]
-            with st.spinner("Generating thumbnails..."):
-                try:
-                    generator = ThumbnailGenerator(provider="gemini", api_key=gemini_key.strip(), model=image_model.strip())
-                    images = generator.generate(
-                        title=f"Inspired by: {base_title}",
-                        context=creative_brief,
-                        style="High contrast, one clear subject, bold science aesthetic, 16:9 composition",
-                        negative_prompt="clutter, tiny text, low contrast",
-                        count=3,
-                    )
-                    out_dir = os.path.join("outputs", "thumbnails")
-                    os.makedirs(out_dir, exist_ok=True)
-                    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            try:
+                generator = ThumbnailGenerator(provider="gemini", api_key=gemini_key.strip(), model=image_model.strip())
+                images = generator.generate(
+                    title=f"Inspired by: {base_title}",
+                    context=creative_brief,
+                    style=str(brand_kit.get("visual_style", "High contrast, one clear subject, 16:9 composition")),
+                    negative_prompt="clutter, tiny text, low contrast",
+                    count=3,
+                )
+                out_dir = os.path.join("outputs", "thumbnails")
+                os.makedirs(out_dir, exist_ok=True)
+                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-                    for idx, generated in enumerate(images, start=1):
-                        st.image(generated.image_bytes, caption=f"Ytuber Thumbnail {idx}")
-                        ext = "png" if "png" in generated.mime_type else "jpg"
-                        filename = f"ytuber_{channel_id}_{ts}_{idx}.{ext}"
-                        with open(os.path.join(out_dir, filename), "wb") as fp:
-                            fp.write(generated.image_bytes)
-                        st.download_button(
-                            label=f"Download thumbnail {idx}",
-                            data=generated.image_bytes,
-                            file_name=filename,
-                            mime=generated.mime_type,
-                            key=f"ytuber_thumb_{idx}_{ts}",
-                            use_container_width=True,
-                        )
-                except Exception as exc:
-                    st.error(f"Thumbnail generation failed: {exc}")
+                for idx, generated in enumerate(images, start=1):
+                    st.image(generated.image_bytes, caption=f"Ytuber Thumbnail {idx}")
+                    ext = "png" if "png" in generated.mime_type else "jpg"
+                    filename = f"ytuber_{channel_id}_{ts}_{idx}.{ext}"
+                    with open(os.path.join(out_dir, filename), "wb") as fp:
+                        fp.write(generated.image_bytes)
+                    st.download_button(
+                        label=f"Download thumbnail {idx}",
+                        data=generated.image_bytes,
+                        file_name=filename,
+                        mime=generated.mime_type,
+                        key=f"ytuber_thumb_{idx}_{ts}",
+                        use_container_width=True,
+                    )
+            except Exception as exc:
+                st.error(f"Thumbnail generation failed: {exc}")
 
 
 def render() -> None:
@@ -942,7 +1400,7 @@ def render() -> None:
         return
 
     st.caption(
-        "Creator Suite: cache-aware channel sync, analytics, SEO tooling, competitor tracking, trend radar, planner, and AI studio."
+        "Creator Suite: cache-aware channel sync, analytics, SEO tooling, competitor tracking, trend APIs, transcript lab, comments intelligence, and AI studio."
     )
 
     youtube_api_key = st.text_input("YouTube API Key", value=os.getenv("YOUTUBE_API_KEY", ""), type="password")
@@ -997,9 +1455,16 @@ def render() -> None:
             "Channel Audit",
             "Keyword Intel",
             "Title & SEO Lab",
+            "Title A/B Lab",
             "Competitor Benchmark",
+            "Content Gap Finder",
             "Trend Radar",
+            "Trend APIs",
+            "Comment Intelligence",
+            "Transcript Lab",
             "Content Planner",
+            "Thumbnail Critic",
+            "Brand Kit",
             "AI Studio",
         ]
     )
@@ -1019,14 +1484,39 @@ def render() -> None:
         _render_title_seo_lab(hints)
 
     with tabs[4]:
-        _render_competitor_benchmark(youtube_api_key)
+        hints = st.session_state.get("ytuber_keyword_hints") or _top_keywords(channel_df, 20)
+        _render_title_ab_lab(hints, os.getenv("GEMINI_API_KEY", ""), "gemini-2.0-flash")
 
     with tabs[5]:
-        _render_trend_radar(channel_df)
+        _render_competitor_benchmark(youtube_api_key)
 
     with tabs[6]:
-        _render_content_planner(channel_df)
+        _render_content_gap_finder(channel_df, youtube_api_key)
 
     with tabs[7]:
+        _render_trend_radar(channel_df)
+
+    with tabs[8]:
         hints = st.session_state.get("ytuber_keyword_hints") or _top_keywords(channel_df, 20)
-        _render_ai_studio(channel_df, channel_title, channel_id, hints)
+        _render_trend_api(hints)
+
+    with tabs[9]:
+        _render_comment_intelligence(channel_df, youtube_api_key)
+
+    with tabs[10]:
+        _render_transcript_lab(channel_df, os.getenv("GEMINI_API_KEY", ""), "gemini-2.0-flash")
+
+    with tabs[11]:
+        _render_content_planner(channel_df)
+
+    with tabs[12]:
+        _render_thumbnail_critic(os.getenv("GEMINI_API_KEY", ""), "gemini-2.0-flash")
+
+    with tabs[13]:
+        brand_kit = _render_brand_kit_manager()
+        st.session_state["ytuber_brand_kit"] = brand_kit
+
+    with tabs[14]:
+        hints = st.session_state.get("ytuber_keyword_hints") or _top_keywords(channel_df, 20)
+        brand_kit = st.session_state.get("ytuber_brand_kit") or _load_brand_kit()
+        _render_ai_studio(channel_df, channel_title, channel_id, hints, brand_kit)

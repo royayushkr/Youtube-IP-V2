@@ -8,21 +8,27 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dashboard.components.sidebar import render_sidebar
-from dashboard.views import channel_analysis, recommendations, ytuber
+from dashboard.components.theme import inject_theme
+from dashboard.extensions.registry import get_navigation_items
+from dashboard.views import channel_analysis, extension_center, home, recommendations, ytuber
 
 
 st.set_page_config(page_title="YouTube IP Dashboard", page_icon="📺", layout="wide")
+inject_theme()
 
+PAGES = {
+    "Home": home.render,
+    "Channel Analysis": channel_analysis.render,
+    "Recommendations": recommendations.render,
+    "Ytuber": ytuber.render,
+    "Extension Center": extension_center.render,
+    "Deploy Notes": None,
+}
 
-page = render_sidebar()
+nav_items = [p for p in get_navigation_items() if p in PAGES]
+page = render_sidebar(nav_items)
 
-if page == "Channel Analysis":
-    channel_analysis.render()
-elif page == "Recommendations":
-    recommendations.render()
-elif page == "Ytuber":
-    ytuber.render()
-else:
+if page == "Deploy Notes":
     st.title("Deploy Notes")
     st.markdown(
         """
@@ -34,12 +40,18 @@ else:
         ### Local Run
         ```bash
         source .venv/bin/activate
-        streamlit run dashboard/app.py
+        python3 -m streamlit run dashboard/app.py
         ```
 
         ### Streamlit Cloud
-        1. Push this repo to GitHub.
-        2. Create a new Streamlit app with entrypoint `dashboard/app.py`.
-        3. Add secrets for required API keys.
+        1. Push to GitHub.
+        2. Create app with entrypoint `dashboard/app.py`.
+        3. Add required secrets.
         """
     )
+else:
+    render_fn = PAGES.get(page)
+    if render_fn is None:
+        st.error("Selected page is not configured.")
+    else:
+        render_fn()
